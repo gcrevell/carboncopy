@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+#
+# carboncopy -- copy the SHAPE of a private Gitea instance's commit history onto
+# a public GitHub contribution graph, and nothing else about it.
+#
+# For every commit on the default branch of every non-mirror repository the
+# configured token can see, authored by one of CARBONCOPY_AUTHORS, this appends
+# one line to ledger.txt and makes one commit stamped with that commit's
+# original author date, then pushes. GitHub attributes a contribution by author
+# date and author email, so the graph this fills in ends up the same shape as
+# the private instance's -- without that instance being reachable from, or known
+# to, GitHub.
+#
+# NOTHING ABOUT THE WORK ITSELF IS EVER WRITTEN HERE. Not repository names, not
+# commit messages, not file names, not branch names, not the source hashes. A
+# ledger line is sha256(repo + NUL + hash) truncated to 16 hex characters:
+# enough to recognise a commit already copied, useless to anyone who cannot
+# already guess both halves. This repository is public and the instance it reads
+# is not -- keep anything added later on that side of the line.
+#
+# Mirrors are skipped because a mirror's commits already exist on whatever it
+# mirrors from, which for a homelab Gitea usually means GitHub -- already
+# counted, and copying them would count them twice.
+#
+# Requires bash 4+ (associative arrays), git, curl and jq.
+
+# set -e, unlike the Telegraf collectors this borrows its house style from:
+# those degrade to "nothing to report" and must never take a monitoring agent
+# down with them. This one writes to a repository, so it stops at the first
+# thing that does not go to plan rather than pushing a half-built history.
+set -euo pipefail
+
+readonly PROGNAME=carboncopy
+
+die()  { printf '%s: %s\n' "$PROGNAME" "$*" >&2; exit 1; }
+note() { printf '%s: %s\n' "$PROGNAME" "$*"; }
+
+usage() {
+  cat <<'USAGE'
+usage: carboncopy [-n|--dry-run]
+
+Copies the commit activity of every non-mirror repository in a Gitea instance
+into this repository, one backdated commit per source commit, then pushes.
+
+  -n, --dry-run   Report what would be copied. Touches no ref and pushes
+                  nothing, and does not sync the checkout first, so its counts
+                  are against the ledger as it stands on disk.
+
+Configuration (environment):
+  CARBONCOPY_GITEA_URL     Base URL of the Gitea instance.        (required)
+  CARBONCOPY_GITEA_TOKEN   Gitea access token, read scope is enough. (required)
+  CARBONCOPY_AUTHORS       Author emails to copy, comma or space separated.
+                           Anything else on the branch -- bots, other people --
+                           is left behind.                        (required)
+  CARBONCOPY_EXCLUDE       owner/name entries to skip, comma or space
+                           separated. Deliberately not a file in this
+                           repository: the names of private repositories are
+                           exactly what this is built not to publish.
+  CARBONCOPY_REMOTE        Push remote.                       (default: origin)
+  CARBONCOPY_BRANCH        Branch to commit on.       (default: current branch)
+  CARBONCOPY_NAME          Author name on the copies.  (default: git config)
+  CARBONCOPY_EMAIL         Author email on the copies. (default: git config)
+                           Must be a VERIFIED email on the GitHub account, or
+                           the commits land and the graph stays empty.
+USAGE
+}
+
+dry_run=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) dry_run=true ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            usage >&2; die "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+for cmd in git curl jq; do
+  command -v "$cmd" >/dev/null 2>&1 || die "$cmd is required and is not installed"
+done
+
+gitea_url="${CARBONCOPY_GITEA_URL:-}"
+gitea_token="${CARBONCOPY_GITEA_TOKEN:-}"
+authors="${CARBONCOPY_AUTHORS:-}"
+exclude="${CARBONCOPY_EXCLUDE:-}"
+remote="${CARBONCOPY_REMOTE:-origin}"
+
+[ -n "$gitea_url" ]   || { usage >&2; die "CARBONCOPY_GITEA_URL is not set"; }
+[ -n "$gitea_token" ] || { usage >&2; die "CARBONCOPY_GITEA_TOKEN is not set"; }
+# No default. An empty allowlist that meant "everyone" would quietly put a
+# dependency bot's merges, and every other contributor's commits, on your
+# contribution graph as your own work.
+[ -n "$authors" ]     || { usage >&2; die "CARBONCOPY_AUTHORS is not set"; }
+
+# Trailing slash tolerated in the URL, since that is how Gitea prints its own
+# ROOT_URL and how tea stores a login.
+gitea_url="${gitea_url%/}"
+
+# The repository this lives in, found from the script rather than from $PWD:
+# systemd sets a WorkingDirectory but a shell does not, and getting this wrong
+# means committing the ledger into whatever checkout you happened to be sitting
+# in.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(git -C "$script_dir" rev-parse --show-toplevel)" \
+  || die "$script_dir is not inside a git repository"
+readonly ledger="$repo_root/ledger.txt"
+
+branch="${CARBONCOPY_BRANCH:-$(git -C "$repo_root" symbolic-ref --short HEAD)}"
+
+# Inherited from git config so a checkout that already commits as you keeps
+# doing so -- including commit.gpgsign, which is left exactly as configured
+# rather than forced either way.
+name="${CARBONCOPY_NAME:-$(git -C "$repo_root" config user.name || true)}"
+email="${CARBONCOPY_EMAIL:-$(git -C "$repo_root" config user.email || true)}"
+if [ -z "$name" ] || [ -z "$email" ]; then
+  die "no commit identity: set CARBONCOPY_NAME and CARBONCOPY_EMAIL, or user.name
+       and user.email in $repo_root. The email has to be one GitHub has
+       verified on the account, or every copy lands correctly and contributes
+       nothing."
+fi
+
+tmp="$(mktemp -d)"
+
+# Set to true only once the copy loop is entered, and read by the trap below.
+copying=false
+
+# A run that dies between appending a ledger line and committing it would leave
+# the checkout dirty, and the clean-tree precondition below would then refuse
+# every run after it -- a wedge needing a human, for a transient failure like a
+# signing key that was briefly unreadable. Discarding the working tree is safe
+# here and nowhere else in this script: the precondition has already proven
+# there was nothing in it to lose. Commits this run made are deliberately left
+# alone; the next run's reset to the remote is what clears those.
+cleanup() {
+  local status=$?
+  [ "$copying" = false ] || git -C "$repo_root" reset --quiet --hard HEAD
+  rm -rf "$tmp"
+  exit "$status"
+}
+trap cleanup EXIT
+
+# Truncated to 64 bits. At the ~10^4 rows a personal instance reaches over a
+# working life, the odds of two source commits colliding into one ledger line
+# are around one in 10^11.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum | cut -c1-16; }
+else
+  sha256() { shasum -a 256 | cut -c1-16; }   # BSD userland, for a run by hand
+fi
+
+# ---------------------------------------------------------------------------
+# Gitea API
+#
+# Every page of every endpoint, on every run -- no window and no stored cursor.
+# A full walk is a couple of dozen requests against a personal instance, and it
+# leaves no catch-up path to get wrong: a repository that was unreachable
+# yesterday, or created with backdated history, is picked up whole tomorrow.
+# ---------------------------------------------------------------------------
+
+# Gitea clamps limit to MAX_RESPONSE_ITEMS (50 by default) and silently returns
+# a shorter page instead of erroring, so ask for exactly that and page on
+# X-PageCount rather than on "a short page means the last page".
+readonly page_limit=50
+
+api_paged() {  # path, jq filter -> filter output for every page, in order
+  local path="$1" filter="$2" page=1 pages=1 sep='?' status
+  case "$path" in *\?*) sep='&' ;; esac
+
+  while [ "$page" -le "$pages" ]; do
+    status="$(curl -sS --max-time 60 -o "$tmp/body" -D "$tmp/head" -w '%{http_code}' \
+      -H "Authorization: token $gitea_token" \
+      -H 'Accept: application/json' \
+      "$gitea_url/api/v1/${path}${sep}page=${page}&limit=${page_limit}")" \
+      || die "cannot reach $gitea_url -- is the instance up and routable from here?"
+
+    case "$status" in
+      200) ;;
+      401|403) die "$gitea_url/api/v1/$path returned HTTP $status -- CARBONCOPY_GITEA_TOKEN is wrong, expired, or lacks read scope" ;;
+      *)       die "$gitea_url/api/v1/$path returned HTTP $status" ;;
+    esac
+
+    # Read once, from the first page: the header is on every response, but a
+    # repository pushed to mid-walk would otherwise move the goalposts.
+    if [ "$page" -eq 1 ]; then
+      pages="$(awk -F': *' 'tolower($1) == "x-pagecount" { gsub(/\r/, "", $2); print $2; exit }' "$tmp/head")"
+      [ -n "$pages" ] || pages=1
+    fi
+
+    jq -r "$filter" < "$tmp/body" || die "unexpected response body from $path"
+    page=$((page + 1))
+  done
+}
+
+# Gitea timestamps are RFC 3339 carrying the committer's own UTC offset
+# ("2026-09-04T10:33:15-05:00"), and jq's fromdateiso8601 accepts a trailing Z
+# and nothing else. Parsing the naive half and applying the offset by hand is
+# what makes commits from two different offsets sort against each other
+# correctly -- the epoch is used for ordering only, never for stamping, so no
+# offset is ever lost on the way to git.
+# shellcheck disable=SC2016  # $naive, $off and $shift are jq's variables, not the shell's.
+readonly jq_iso_epoch='
+  def iso_epoch:
+    (.[0:19] + "Z" | fromdateiso8601) as $naive
+    | .[19:] as $off
+    | if ($off == "Z" or $off == "") then $naive
+      else ((($off[1:3] | tonumber) * 3600) + (($off[4:6] | tonumber) * 60)) as $shift
+        | if $off[0:1] == "-" then $naive + $shift else $naive - $shift end
+      end;
+'
+
+# ---------------------------------------------------------------------------
+# Sync the checkout
+#
+# Before reading the ledger, not after: the ledger on origin is the only record
+# of what has already been copied, and a run that read a stale one would copy
+# those commits a second time. It is also what makes a failed push self-healing
+# -- the commits from the failed run are discarded here and rebuilt below from
+# a ledger that never got them.
+#
+# Safe to do while this very file is being read: git replaces a changed file by
+# unlinking it and creating a new one, so the shell keeps reading the inode it
+# opened and the next run is the one that gets the new script.
+# ---------------------------------------------------------------------------
+if [ "$dry_run" = false ]; then
+  if ! git -C "$repo_root" diff --quiet || ! git -C "$repo_root" diff --cached --quiet; then
+    die "$repo_root has uncommitted changes. This checkout is machine-owned and
+       gets reset to $remote/$branch on every run; commit or discard them
+       somewhere else first."
+  fi
+  git -C "$repo_root" fetch --quiet "$remote" "$branch"
+  git -C "$repo_root" reset --quiet --hard "$remote/$branch"
+fi
+
+declare -A copied=()
+if [ -f "$ledger" ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    copied["$line"]=1
+  done < "$ledger"
+fi
+
+declare -A wanted=()
+IFS=', ' read -r -a author_list <<< "$authors"
+for addr in "${author_list[@]}"; do
+  [ -n "$addr" ] && wanted["${addr,,}"]=1
+done
+
+declare -A skip=()
+if [ -n "$exclude" ]; then
+  IFS=', ' read -r -a exclude_list <<< "$exclude"
+  for entry in "${exclude_list[@]}"; do
+    [ -n "$entry" ] && skip["${entry,,}"]=1
+  done
+fi
+
+# This repository, whatever it is called on the far end. A safety belt, not a
+# nicety: pushed to Gitea as an ordinary repository rather than a mirror, this
+# one would feed on its own output, every run copying the copies the last run
+# made.
+remote_url="$(git -C "$repo_root" remote get-url "$remote")" \
+  || die "no remote named '$remote' in $repo_root -- nothing to push to"
+self="$(basename "$remote_url" .git)"
+
+# ---------------------------------------------------------------------------
+# Walk the instance
+# ---------------------------------------------------------------------------
+
+# Forks are deliberately NOT skipped alongside mirrors. A fork's history is
+# mostly upstream's, and the author allowlist already leaves all of it behind;
+# what survives is the commits you actually wrote on it, which is right.
+# Archived repositories stay in too -- work you have stopped doing is still
+# work you did.
+api_paged 'user/repos' '
+  .[]
+  | select(.mirror | not)
+  | select(.empty | not)
+  | [.full_name, .default_branch]
+  | @tsv' > "$tmp/repos"
+
+: > "$tmp/new"
+repo_count=0
+
+while IFS=$'\t' read -r full_name default_branch; do
+  [ -n "$full_name" ] || continue
+
+  if [ -n "${skip[${full_name,,}]:-}" ]; then
+    note "skipping $full_name (excluded)"
+    continue
+  fi
+  if [ "${full_name##*/}" = "$self" ]; then
+    note "skipping $full_name (this repository)"
+    continue
+  fi
+
+  repo_count=$((repo_count + 1))
+
+  # sha= pins the walk to the default branch. Not --all, for the same reason
+  # the fleet's commit-activity collector uses HEAD: on a squash-merge
+  # workflow every branch commit would count, then the squash commit that
+  # replaced them would count again. The cost, stated rather than hidden:
+  # work in progress is invisible until it merges, and a squash-merged pull
+  # request contributes exactly one day's dot -- the day it merged, since that
+  # is the author date Gitea stamps the squash with.
+  #
+  # stat/verification/files off: three joins and a signature check per commit,
+  # for fields this never reads.
+  api_paged "repos/${full_name}/commits?sha=${default_branch}&stat=false&verification=false&files=false" "
+    ${jq_iso_epoch}
+    .[]
+    | [ (.commit.author.date | iso_epoch), .commit.author.date, (.commit.author.email | ascii_downcase), .sha ]
+    | @tsv" > "$tmp/commits"
+
+  seen=0
+  fresh=0
+  while IFS=$'\t' read -r epoch date author sha; do
+    [ -n "$sha" ] || continue
+    seen=$((seen + 1))
+    [ -n "${wanted[$author]:-}" ] || continue
+    # NUL between the halves so that a repository named "a/b" and a hash
+    # "c" cannot digest to the same line as "a" and "b/c".
+    digest="$(printf '%s\0%s' "$full_name" "$sha" | sha256)"
+    [ -z "${copied[$digest]:-}" ] || continue
+    copied["$digest"]=1
+    fresh=$((fresh + 1))
+    printf '%s\t%s\t%s\n' "$epoch" "$date" "$digest" >> "$tmp/new"
+  done < "$tmp/commits"
+
+  note "$full_name: $seen commits on $default_branch, $fresh to copy"
+done < "$tmp/repos"
+
+# Oldest first, so the copy reads as a history rather than as the order the API
+# happened to return repositories in. -s keeps commits sharing a second in the
+# order the branch had them.
+sort -n -s -k1,1 "$tmp/new" > "$tmp/ordered"
+total="$(wc -l < "$tmp/ordered" | tr -d ' ')"
+
+if [ "$total" -eq 0 ]; then
+  note "nothing new across $repo_count repositories"
+  exit 0
+fi
+
+if [ "$dry_run" = true ]; then
+  note "would copy $total commits from $repo_count repositories:"
+  # Day and count only. A dry run prints to a terminal, but it also prints to
+  # whatever is capturing it.
+  cut -f2 "$tmp/ordered" | cut -c1-10 | uniq -c | sed 's/^/       /'
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Copy
+#
+# One commit per source commit, stamped with the source's author date and its
+# original UTC offset -- passed through as the string Gitea returned, so the
+# copy falls on the day the work did, in the timezone it was done in.
+#
+# Author date AND committer date: GitHub's contribution calendar reads the
+# author date, its API's commit listings read the committer date, and setting
+# both to the same instant means never having to be sure which one is looking.
+# ---------------------------------------------------------------------------
+copying=true
+while IFS=$'\t' read -r epoch date digest; do
+  printf '%s\n' "$digest" >> "$ledger"
+  git -C "$repo_root" add -- "$ledger"
+  GIT_AUTHOR_NAME="$name"       GIT_COMMITTER_NAME="$name" \
+  GIT_AUTHOR_EMAIL="$email"     GIT_COMMITTER_EMAIL="$email" \
+  GIT_AUTHOR_DATE="$date"       GIT_COMMITTER_DATE="$date" \
+    git -C "$repo_root" commit --quiet --message "$PROGNAME $digest"
+done < "$tmp/ordered"
+
+copying=false
+git -C "$repo_root" push --quiet "$remote" "$branch"
+note "copied $total commits from $repo_count repositories"

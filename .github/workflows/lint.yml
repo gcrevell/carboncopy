@@ -1,0 +1,26 @@
+---
+name: Lint
+
+# paths, not a bare branch filter: the daily copy pushes to main every day and
+# only ever touches ledger.txt, so without this every one of those pushes would
+# lint an unchanged script.
+on:
+  push:
+    branches: [main]
+    paths:
+      - bin/**
+      - .github/workflows/**
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # shellcheck is preinstalled on the GitHub runner image.
+      - name: Shell script parses and lints
+        run: |
+          set -eu
+          bash -n bin/carboncopy
+          shellcheck bin/carboncopy
